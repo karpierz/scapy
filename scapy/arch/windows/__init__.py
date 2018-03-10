@@ -41,6 +41,10 @@ _winapi_SetHandleInformation = ctypes.windll.kernel32.SetHandleInformation
 _winapi_SetHandleInformation.restype = wintypes.BOOL
 _winapi_SetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
 
+_winapi_GetCurrentProcessId = ctypes.windll.kernel32.GetCurrentProcessId
+_winapi_GetCurrentProcessId.restype = wintypes.DWORD
+_winapi_GetCurrentProcessId.argtypes = []
+
 conf.use_pcap = False
 conf.use_dnet = False
 conf.use_winpcapy = True
@@ -96,7 +100,7 @@ def _windows_title(title=None):
     if conf.interactive:
         _winapi_SetConsoleTitle(title or "Scapy v{}".format(conf.version))
 
-def _suppress_file_handles_inheritance(r=1000):
+def _suppress_handles_inheritance():
     """HACK: python 2.7 file descriptors.
 
     This magic hack fixes https://bugs.python.org/issue19575
@@ -108,28 +112,22 @@ def _suppress_file_handles_inheritance(r=1000):
     if sys.version_info[0:2] >= (3, 4):
         return []
 
-    import stat
-    from msvcrt import get_osfhandle
-
-    HANDLE_FLAG_INHERIT = 0x00000001
-
     handles = []
-    for fd in range(r):
+    for hinfo in _get_opened_handles():
+        handle = hinfo.HandleValue
         try:
-            s = os.fstat(fd)
-        except OSError:
-            continue
-        if stat.S_ISREG(s.st_mode):
-            osf_handle = get_osfhandle(fd)
-            flags = wintypes.DWORD()
-            _winapi_GetHandleInformation(osf_handle, flags)
-            if flags.value & HANDLE_FLAG_INHERIT:
-                _winapi_SetHandleInformation(osf_handle, HANDLE_FLAG_INHERIT, 0)
-                handles.append(osf_handle)
+            flag = _get_handle_inheritable(handle)
+            if flag:
+                _set_handle_inheritable(handle, False)
+        except (ctypes.WinError, WindowsError, OSError):
+            pass
+        else:
+            if flag:
+                handles.append(handle)
 
     return handles
 
-def _restore_file_handles_inheritance(handles):
+def _restore_handles_inheritance(handles):
     """HACK: python 2.7 file descriptors.
 
     This magic hack fixes https://bugs.python.org/issue19575
@@ -141,20 +139,105 @@ def _restore_file_handles_inheritance(handles):
     if sys.version_info[0:2] >= (3, 4):
         return
 
-    HANDLE_FLAG_INHERIT = 0x00000001
-
-    for osf_handle in handles:
+    for handle in handles:
         try:
-            _winapi_SetHandleInformation(osf_handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+            _set_handle_inheritable(handle, True)
         except (ctypes.WinError, WindowsError, OSError):
             pass
+
+def _get_opened_handles():
+
+    from ctypes import windll
+    from msvcrt import get_osfhandle
+
+    PVOID = ctypes.c_void_p
+    SYSTEM_INFORMATION_CLASS = ctypes.c_int
+    NTSTATUS = ctypes.c_ulong
+
+    SystemExtendedHandleInformation = SYSTEM_INFORMATION_CLASS(64)
+
+    STATUS_INFO_LENGTH_MISMATCH = NTSTATUS(0xC0000004)
+
+    class SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX(ctypes.Structure):
+        _fields_ = [
+        ("Object",                PVOID),
+        ("UniqueProcessId",       wintypes.ULONG),
+        ("HandleValue",           wintypes.ULONG),
+        ("GrantedAccess",         wintypes.ULONG),
+        ("CreatorBackTraceIndex", wintypes.USHORT),
+        ("ObjectTypeIndex",       wintypes.USHORT),
+        ("HandleAttributes",      wintypes.ULONG),
+        ("Reserved",              wintypes.ULONG),
+    ]
+
+    handles_count = 0x10000
+    while True:
+
+        class SYSTEM_HANDLE_INFORMATION_EX(ctypes.Structure):
+            _fields_ = [
+            ("NumberOfHandles", wintypes.ULONG),
+            ("Reserved",        wintypes.ULONG),
+            ("Handles", (SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX * handles_count)),
+        ]
+
+        system_handle_info = SYSTEM_HANDLE_INFORMATION_EX(0, 0)
+        handle_info_size = wintypes.DWORD(ctypes.sizeof(system_handle_info))
+        return_info_size = wintypes.DWORD(0)
+        status = NTSTATUS(windll.ntdll.NtQuerySystemInformation(
+                          SystemExtendedHandleInformation,
+                          ctypes.cast(ctypes.pointer(system_handle_info), PVOID),
+                          handle_info_size,
+                          ctypes.byref(return_info_size)))
+        if status.value != STATUS_INFO_LENGTH_MISMATCH.value:
+            break
+
+        # NtQuerySystemInformation won't give us the correct buffer size,
+        # so we guess by doubling the buffer size.
+        handles_count *= 2
+
+    if status.value: # NT_SUCCESS(status.value):
+        raise PyErr_SetFromWindowsErr(HRESULT_FROM_NT(status));
+
+    # Get the current process PID.
+    pid = _winapi_GetCurrentProcessId()
+
+    opened_handles = []
+    for i in range(system_handle_info.NumberOfHandles):
+        hinfo = system_handle_info.Handles[i]
+        # Check if this hinfo belongs to the current process PID.
+        if hinfo.UniqueProcessId == pid:
+            opened_handles.append(hinfo)
+
+    return opened_handles
+
+def _get_handle_inheritable(handle):
+
+    # ctypes's backport from PY3's os module.
+
+    HANDLE_FLAG_INHERIT = 1
+
+    flags = wintypes.DWORD()
+    if not _winapi_GetHandleInformation(handle, flags):
+        raise ctypes.WinError()
+
+    return bool(flags.value & HANDLE_FLAG_INHERIT)
+
+def _set_handle_inheritable(handle, inheritable):
+
+    # ctypes's backport from PY3's os module.
+
+    HANDLE_FLAG_INHERIT = 1
+
+    if not _winapi_SetHandleInformation(handle, HANDLE_FLAG_INHERIT,
+                                        HANDLE_FLAG_INHERIT if inheritable else 0):
+        raise ctypes.WinError()
 
 class _PowershellManager(Thread):
     """Instance used to send multiple commands on the same Powershell process.
     Will be instantiated on loading and automatically stopped.
     """
     def __init__(self):
-        opened_handles = _suppress_file_handles_inheritance()
+        opened_handles = _suppress_handles_inheritance()
         try:
             # Start & redirect input
             if conf.prog.powershell:
@@ -166,7 +249,7 @@ class _PowershellManager(Thread):
             self.process = sp.Popen(cmd, stdout=sp.PIPE, stdin=sp.PIPE, stderr=sp.STDOUT)
             self.cmd = not conf.prog.powershell
         finally:
-            _restore_file_handles_inheritance(opened_handles)
+            _restore_handles_inheritance(opened_handles)
         self.buffer = []
         self.running = True
         self.query_complete = Event()
